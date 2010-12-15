@@ -1,0 +1,383 @@
+<?php
+/* 
+ * $Id: securepay.module  $
+ */
+
+function securepay_help($section = '') {
+  switch ($section) {
+    case 'admin/ecsettings/securepay':
+      return t('Enter the required parameters that have been supplied during the signup process with securepay.');
+      break;
+  }
+}
+
+function securepay_menu($maycache) {
+  if ($maycache) {
+    $items[] = array(
+      'path' => 'store/payment/securepay',
+      'title' => t('Enter Credit Card Details'),
+      'callback' => 'securepay_enter_payment',
+      'access' => 1,
+      'type' => MENU_CALLBACK
+    );
+    $items[] = array(
+      'path' => 'admin/ecsettings/securepay',
+      'title' => 'securepay',
+      'callback' => 'drupal_get_form',
+      'callback arguments' => array('securepay_ec_settings'),
+      'access' => user_access('administer store'),
+      'type' => MENU_NORMAL_ITEM,
+      'description' => t('Configuration of the securepay gateway'),
+    );
+  }
+  return $items;
+}
+
+function securepay_ec_settings() {
+  $form = array();
+  $form['secure_pay_merchant_id'] = array(
+    '#type' => 'textfield', 
+    '#title' => t('Securepay Merchant Id'), 
+    '#default_value' => variable_get('secure_pay_merchant_id', ''), 
+    '#size' => 70, 
+    '#maxlength' => 70, 
+    '#required' => true
+   );
+  $form['secure_pay_pass'] = array(
+    '#type' => 'textfield', 
+    '#title' => t('Securepay Password'), 
+    '#default_value' => variable_get('secure_pay_pass', ''), 
+    '#size' => 70, 
+    '#maxlength' => 70, 
+    '#required' => true
+   );
+  $form['secure_pay_testing_pass'] = array(
+    '#type' => 'textfield', 
+    '#title' => t('Securepay testing Password'), 
+    '#default_value' => variable_get('secure_pay_testing_pass', ''), 
+    '#size' => 70, 
+    '#maxlength' => 70, 
+    '#required' => true
+   );
+
+  $form['securepay_url'] = array(
+    '#type' => 'textfield', 
+    '#title' => t('Credit Card Payment Page'), 
+    '#default_value' => variable_get('securepay_url', url('store/payment/securepay', null, null, true)), 
+    '#size' => 70, 
+    '#maxlength' => 180, 
+    '#description' => t('URL to be directed to so that the payment can be received.'),
+    '#required' => true
+   );
+  $form['securepay_thanks_url'] = array(
+    '#type' => 'textfield', 
+    '#title' => t('Thank you Page'), 
+    '#default_value' => variable_get('securepay_thanks_url', url('node', null, null, true)), 
+    '#size' => 70, 
+    '#maxlength' => 180, 
+    '#description' => t('URL to be directed once the payment has been entered.'),
+    '#required' => true
+   );
+  $form['securepay_flood_threshold'] = array(
+    '#type' => 'textfield', 
+    '#title' => t('Flood Threshold'), 
+    '#default_value' => variable_get('securepay_flood_threshold', 3), 
+    '#description' => t('How many times the securepay form can be submitted from one IP address in one hour.'),
+   );
+  return system_settings_form($form);
+}
+
+function securepay_paymentapi(&$edit, $op, $arg = '') {
+  switch ($op) {
+    case 'display name':
+      return t('Secure Pay');
+      break;
+    case 'payment page':
+      if ($edit->gross > 0) {
+        return payment_cc_goto($edit, variable_get('securepay_url', 'store/payment/securepay'));
+      }
+      break;
+  }
+}
+
+function securepay_ec_transactionapi(&$txn, $op, $a3 = NULL, $a4 = NULL) {
+  if ($txn->payment_method != 'securepay') return NULL;
+  
+  switch($op) {
+    case 'delete':
+      return payment_cc_delete($txn);
+      break;
+    case 'insert':
+    case 'update':
+      return payment_cc_save($txn);
+      break;
+  }
+}
+
+/*
+ * Internal Functions
+ */
+
+function securepay_enter_payment() {
+  global $base_url;
+  global $user;
+  //redirect to https
+  if($user->uid == 0 && strpos($base_url, 'http:') === 0) {
+    $query = $_GET;
+    unset($query['q']);
+    $url = str_replace('http:', 'https:', $base_url);
+    drupal_set_header("Location: $url/store/payment/securepay?". str_replace('&amp;', '&', http_build_query($query)));
+  }
+  
+  $txnid = $_GET['txnid'];
+  $t = store_transaction_load($txnid);
+  if (($user->uid != $t->uid && !user_access('administer store')) || $t->payment_status != 1) {
+    drupal_access_denied();
+    exit();
+  }
+  return drupal_get_form('securepay_payment_form', $t);
+}
+
+function securepay_payment_form($t) {
+  $form['billing'] = array(
+    '#type' => 'credit_card',
+    '#required' => TRUE,
+    '#name' => $t->address['billing']->firstname . ' ' . $t->address['billing']->lastname,
+    '#cvnshow' => TRUE
+  );
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Submit Payment'),
+    '#suffix' => '<i>'.t('Press submit only once').'</i>',
+  );
+  $form['t'] = array(
+    '#type' => 'value',
+    '#value' => $t
+  );
+  $form['payment'] = array(
+    '#type' => 'value',
+  );
+  return $form;
+}
+
+function securepay_payment_form_validate($form_id, $form_values, $form) {
+  if (!flood_is_allowed('securepay', variable_get('securepay_flood_threshold', 3))) {
+    $t = $form_values['t'];
+    watchdog('Secure Pay Flood Trigger', $t->txnid, WATCHDOG_NOTICE);
+    form_set_error('', 'Too many attempts were made. Please contact us to process this payment.');
+  }
+  if (valid_credit_card($form_values)) {
+    if (!_securepay_process($form_values, $form)) {
+      form_set_error('', t('Credit Card Processing Error: %cc_reason', array('%cc_reason' => $form_values['payment']['cc_reason'])));
+    }
+    else {
+      form_set_value($form['payment'], $form_values['payment']);
+    }
+  }
+  flood_register_event('securepay');
+}
+
+function securepay_payment_form_submit($form_id, &$form_values) {
+  $t =& $form_values['t'];
+  $t->payment_status = payment_get_status_id('completed');
+  $form_values['txnid'] = $t->txnid;
+
+  // check to see if there are any shippable items
+  $has_shippable = false;
+  foreach ($t->items as $p) {
+    if (product_is_shippable($p->nid)) {
+      $has_shippable = true;
+      break;
+    }
+  }
+  if (!$has_shippable) {
+    $form_values['workflow'] = 6;
+  }
+
+  store_transaction_save($t);
+  store_send_invoice_email($t->txnid);
+
+  drupal_set_message(t('Your payment has been accepted, thank you'));
+  drupal_goto(variable_get('securepay_thanks_url', ''));
+}
+
+/*
+ * Private functions
+ */
+
+function _securepay_process(&$edit) {
+  $t =& $edit['t'];
+  
+  $timestamp = time();
+  $merchant_id = variable_get('secure_pay_merchant_id', 'ABC0001');
+  $transaction_password = variable_get('secure_pay_testing', false) == false ? variable_get('secure_pay_pass', 'CHANGE_ME') : variable_get('secure_pay_testing_pass', 'CHANGE_ME');
+  $request_type = 'payment';
+  $payment_type = '0';
+  $amount = (variable_get('secure_pay_testing', true)) ? '100' : $t->gross * 100;
+  $payment_reference = md5(rand(1,999));
+  $currency = 'AUD';
+  $pre_auth_id = '';
+  $card_number = $edit['cardnumber'];
+  $cvn = $edit['cvn'];
+  $expirymonth = $edit['expiry']['expmonth'];
+  $expiryyear = $edit['expiry']['expyear'];
+  
+  $vars = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" .
+"<SecurePayMessage>" .
+	"<MessageInfo>" .
+		"<messageID>8af793f9af34bea0cf40f5fb5c630c</messageID>" .
+		"<messageTimestamp>$timestamp</messageTimestamp>" .
+		"<timeoutValue>60</timeoutValue>" .
+		"<apiVersion>xml-4.2</apiVersion>" .
+	"</MessageInfo>" .
+	"<MerchantInfo>" .
+		"<merchantID>$merchant_id</merchantID>" .
+		"<password>$transaction_password</password>" .
+	"</MerchantInfo>" .
+	"<RequestType>$request_type</RequestType>" .
+	"<Payment>" .
+		"<TxnList count=\"1\">" .
+			"<Txn ID=\"1\">" .
+				"<txnType>$payment_type</txnType>" .
+				"<txnSource>23</txnSource>" .
+				"<amount>$amount</amount>" .
+				"<purchaseOrderNo>$payment_reference</purchaseOrderNo>" .
+				"<currency>$currency</currency>" .
+				"<preauthID></preauthID>" .
+				"<txnID>$pre_auth_id</txnID>" .
+				"<CreditCardInfo>" .
+					"<cardNumber>$card_number</cardNumber>" .
+					"<cvv>$cvn</cvv>" .
+					"<expiryDate>$expirymonth/$expiryyear</expiryDate>" .
+				"</CreditCardInfo>" .
+			"</Txn>" .
+		"</TxnList>" .
+	"</Payment>" .
+"</SecurePayMessage>";
+
+
+  $response = securepay_openSocket(securepay_get_host(), $vars);
+
+  $xmlres = array();
+  $xmlres = securepay_makeXMLTree($response);
+
+  $response_code = $xmlres['SecurePayMessage']['Payment']['TxnList']['Txn']['responseCode'];
+  $response_text = $xmlres['SecurePayMessage']['Payment']['TxnList']['Txn']['responseText'];
+
+  // From http://www.camtech.com.au/docs/ResponseCodes.pdf
+  $approved = ($response_code == '000' || $response_code == '00' || $response_code == '08' || $response_code == '77') ? TRUE : FALSE;
+
+  if(!$approved) {
+    drupal_set_message($response_text, 'error');
+    watchdog('Secure Pay', sprintf('%s %s - %s == %s ==', $t->txnid, $response_code, $response_text, serialize($xmlres)), WATCHDOG_ERROR);
+  } else {
+    drupal_set_message("Transaction ".$response_text);
+    watchdog('Secure Pay', sprintf('%s %s - %s', $t->txnid, $response_code, $response_text), WATCHDOG_INFO);
+  }
+  
+  return $approved;
+}
+
+function securepay_get_host(){
+  return (variable_get('secure_pay_testing', true)) ? 'www.securepay.com.au/test/payment' : 'www.securepay.com.au/xmlapi/payment';
+}
+
+/**************************/
+/* Secure Socket Function */
+/**************************/
+function securepay_openSocket($host, $query){
+  // Break the URL into usable parts
+  $path = explode('/',$host);
+  $host = $path[0];
+  unset($path[0]);
+  $path = '/'.(implode('/',$path));
+  
+  
+  
+  // Prepare the post query
+  $post  = "POST $path HTTP/1.1\r\n";
+  $post .= "Host: $host\r\n";
+  $post .= "Content-type: application/x-www-form-urlencoded\r\n";
+  $post .= "Content-type: text/xml\r\n";
+  $post .= "Content-length: ".strlen($query)."\r\n";
+  $post .= "Connection: close\r\n\r\n$query";
+
+  //echo "<p>post = </p>";
+  //echo $post;
+
+  $h = fsockopen("ssl://".$host, 443, $errno, $errstr);
+  
+   if ($errstr){
+     print "$errstr ($errno)<br/>\n";
+   }
+   fwrite($h,$post);
+  
+   /*******************************************/
+   /* Retrieve the HTML headers (and discard) */
+   /*******************************************/
+
+  $headers = "";
+  while ($str = trim(fgets($h, 4096))) {
+//echo "Headers1: ".$str."\n";
+    $headers .= "$str\n";
+  }
+
+  $headers2 = "";
+  while ($str = trim(fgets($h, 4096))) {
+    $headers2 .= "$str\n";
+  }
+
+  /**********************************************************/
+  /* Retrieve the response */
+  /**********************************************************/
+  
+  $body = "";
+  while (!feof($h)) {
+    $body .= fgets($h, 4096);
+  }
+  
+  // Close the socket
+  fclose($h);
+  
+  return $body;
+}
+
+
+
+function securepay_makeXMLTree ($data) {
+  $output = array();
+  
+  $parser = xml_parser_create();
+  
+  xml_parser_set_option($parser, XML_OPTION_CASE_FOLDING, 0);
+  xml_parser_set_option($parser, XML_OPTION_SKIP_WHITE, 1);
+  xml_parse_into_struct($parser, $data, $values, $tags);
+  xml_parser_free($parser);
+  
+  $hash_stack = array();
+  
+  foreach ($values as $key => $val) {
+    switch ($val['type']) {
+       case 'open':
+             array_push($hash_stack, $val['tag']);
+             break;
+    
+       case 'close':
+             array_pop($hash_stack);
+             break;
+    
+       case 'complete':
+             array_push($hash_stack, $val['tag']);
+             eval("\$output['" . implode($hash_stack, "']['") . "'] = \"{$val['value']}\";");
+             array_pop($hash_stack);
+             break;
+    }
+  }
+  
+  return $output;
+}
+
+
+
+
+

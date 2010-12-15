@@ -1,0 +1,6 @@
+; $Id: securepay.info $
+core          = "5.0"
+dependencies  = payment
+description   = "Securepay payment gateway in E-Commerce."
+package       = "E-Commerce Payment Methods"
+name          = "Securepay"
