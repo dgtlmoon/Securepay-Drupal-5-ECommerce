@@ -1,1 +1,13 @@
 Securepay.com.au Drupal 5 Ecommerce payment gateway
+
+Originally by Rimian Perkins hello@rimian.com.au 
+Tweaked by Leigh Morresi dgtlmoon@gmail.com
+
+
+Installation:
+
+  Install securepay/ into your sites/all/modules
+  
+Note:
+
+Drupal 5 will no longer be supported in the near future
